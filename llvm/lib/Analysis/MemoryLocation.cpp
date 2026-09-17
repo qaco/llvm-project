@@ -151,16 +151,39 @@ MemoryLocation::getForDest(const CallBase *CB, const TargetLibraryInfo &TLI) {
   return MemoryLocation::getBeforeOrAfter(UsedV, CB->getAAMetadata());
 }
 
-// If the mask for a memory op is a get active lane mask intrinsic
-// we can possibly infer the size of memory written or read
+// The lanes a constant mask enables, when they form a prefix of the vector.
+// Only a prefix lets us describe the access as a narrower vector starting at
+// the same address; a mask with a hole would leave the size an upper bound
+// rather than an exact footprint, which callers such as DSE rely on.
 static std::optional<FixedVectorType *>
-getKnownTypeFromMaskedOp(Value *Mask, VectorType *Ty) {
-  using namespace llvm::PatternMatch;
-  ConstantInt *Op0, *Op1;
-  if (!match(Mask, m_Intrinsic<Intrinsic::get_active_lane_mask>(
-                       m_ConstantInt(Op0), m_ConstantInt(Op1))))
+getKnownTypeFromConstantMask(Constant *Mask, VectorType *Ty) {
+  auto *FixedTy = dyn_cast<FixedVectorType>(Ty);
+  if (!FixedTy)
     return std::nullopt;
 
+  // Note that VectorUtils' possiblyDemandedEltsInMask() cannot be used here:
+  // it is conservative in the opposite direction, reporting every lane as
+  // possibly enabled when the mask is not a constant vector.
+  unsigned NumElts = FixedTy->getNumElements();
+  APInt Enabled(NumElts, 0);
+  for (unsigned I = 0; I != NumElts; ++I) {
+    auto *Elt = dyn_cast_or_null<ConstantInt>(Mask->getAggregateElement(I));
+    if (!Elt)
+      return std::nullopt;
+    Enabled.setBitVal(I, !Elt->isZero());
+  }
+
+  // isMask() holds exactly when the enabled lanes are a non-empty prefix.
+  if (!Enabled.isMask() || Enabled.isAllOnes())
+    return std::nullopt;
+
+  return FixedVectorType::get(FixedTy->getElementType(), Enabled.countr_one());
+}
+
+// The lanes a get_active_lane_mask intrinsic with constant bounds enables.
+static std::optional<FixedVectorType *>
+getKnownTypeFromActiveLaneMask(ConstantInt *Op0, ConstantInt *Op1,
+                               VectorType *Ty) {
   APInt LaneMaskLo = Op0->getValue();
   APInt LaneMaskHi = Op1->getValue();
   if (LaneMaskHi.ule(LaneMaskLo))
@@ -176,6 +199,22 @@ getKnownTypeFromMaskedOp(Value *Mask, VectorType *Ty) {
   }
 
   return FixedVectorType::get(Ty->getElementType(), NumElts.getZExtValue());
+}
+
+// If the mask for a memory op has a shape we recognise, we can infer the size
+// of the memory written or read.
+static std::optional<FixedVectorType *>
+getKnownTypeFromMaskedOp(Value *Mask, VectorType *Ty) {
+  using namespace llvm::PatternMatch;
+  if (auto *C = dyn_cast<Constant>(Mask))
+    return getKnownTypeFromConstantMask(C, Ty);
+
+  ConstantInt *Op0, *Op1;
+  if (match(Mask, m_Intrinsic<Intrinsic::get_active_lane_mask>(
+                      m_ConstantInt(Op0), m_ConstantInt(Op1))))
+    return getKnownTypeFromActiveLaneMask(Op0, Op1, Ty);
+
+  return std::nullopt;
 }
 
 MemoryLocation MemoryLocation::getForArgument(const CallBase *Call,
