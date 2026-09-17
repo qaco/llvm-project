@@ -38,6 +38,7 @@ class AnyMemSetInst;
 class AnyMemTransferInst;
 class BasicBlock;
 class BatchAAResults;
+class CallBase;
 class Function;
 class Instruction;
 class StoreInst;
@@ -178,7 +179,7 @@ public:
   LLVM_ABI void add(const MemoryLocation &Loc);
   LLVM_ABI void add(LoadInst *LI);
   LLVM_ABI void add(StoreInst *SI);
-  LLVM_ABI void addWithoutAATags(StoreInst *SI);
+  LLVM_ABI void addWithoutAATags(Instruction *I);
   LLVM_ABI void add(VAArgInst *VAAI);
   LLVM_ABI void add(AnyMemSetInst *MSI);
   LLVM_ABI void add(AnyMemTransferInst *MTI);
@@ -217,6 +218,12 @@ public:
 
 private:
   friend class AliasSet;
+
+  /// Add the memory locations a call reaches through its pointer arguments.
+  /// Only valid for a call that onlyAccessesArgMemory(). When \p StripAATags
+  /// is set the locations are registered without their AA metadata, for
+  /// clients that must reason about them independently of it.
+  void addArgMemLocations(CallBase *Call, bool StripAATags);
 
   // The total number of memory locations contained in all alias sets.
   unsigned TotalAliasSetSize = 0;

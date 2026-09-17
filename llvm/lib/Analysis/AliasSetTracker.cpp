@@ -329,11 +329,43 @@ void AliasSetTracker::add(StoreInst *SI) {
   addMemoryLocation(MemoryLocation::get(SI), ModRefInfo::Mod);
 }
 
-void AliasSetTracker::addWithoutAATags(StoreInst *SI) {
-  assert(!isStrongerThanMonotonic(SI->getOrdering()) &&
-         "Can't handle release stores here");
-  addMemoryLocation(MemoryLocation::get(SI).getWithoutAATags(),
-                    ModRefInfo::Mod);
+void AliasSetTracker::addWithoutAATags(Instruction *I) {
+  if (auto *SI = dyn_cast<StoreInst>(I)) {
+    assert(!isStrongerThanMonotonic(SI->getOrdering()) &&
+           "Can't handle release stores here");
+    addMemoryLocation(MemoryLocation::get(SI).getWithoutAATags(),
+                      ModRefInfo::Mod);
+    return;
+  }
+
+  // A write through an argument-memory-only call, such as llvm.masked.store.
+  addArgMemLocations(cast<CallBase>(I), /*StripAATags=*/true);
+}
+
+void AliasSetTracker::addArgMemLocations(CallBase *Call, bool StripAATags) {
+  assert(Call->onlyAccessesArgMemory() && "Expected an argmemonly call");
+  ModRefInfo CallMask = AA.getMemoryEffects(Call).getModRef();
+
+  // Some intrinsics are marked as modifying memory for control flow modelling
+  // purposes, but don't actually modify any specific memory location.
+  using namespace PatternMatch;
+  if (Call->use_empty() &&
+      match(Call, m_Intrinsic<Intrinsic::invariant_start>()))
+    CallMask &= ModRefInfo::Ref;
+
+  for (auto IdxArgPair : enumerate(Call->args())) {
+    int ArgIdx = IdxArgPair.index();
+    const Value *Arg = IdxArgPair.value();
+    if (!Arg->getType()->isPointerTy())
+      continue;
+    ModRefInfo ArgMask = AA.getArgModRefInfo(Call, ArgIdx) & CallMask;
+    if (isNoModRef(ArgMask))
+      continue;
+    MemoryLocation ArgLoc =
+        MemoryLocation::getForArgument(Call, ArgIdx, nullptr);
+    addMemoryLocation(StripAATags ? ArgLoc.getWithoutAATags() : ArgLoc,
+                      ArgMask);
+  }
 }
 
 void AliasSetTracker::add(VAArgInst *VAAI) {
@@ -393,28 +425,7 @@ void AliasSetTracker::add(Instruction *I) {
   // Handle all calls with known mod/ref sets genericall
   if (auto *Call = dyn_cast<CallBase>(I))
     if (Call->onlyAccessesArgMemory()) {
-      ModRefInfo CallMask = AA.getMemoryEffects(Call).getModRef();
-
-      // Some intrinsics are marked as modifying memory for control flow
-      // modelling purposes, but don't actually modify any specific memory
-      // location.
-      using namespace PatternMatch;
-      if (Call->use_empty() &&
-          match(Call, m_Intrinsic<Intrinsic::invariant_start>()))
-        CallMask &= ModRefInfo::Ref;
-
-      for (auto IdxArgPair : enumerate(Call->args())) {
-        int ArgIdx = IdxArgPair.index();
-        const Value *Arg = IdxArgPair.value();
-        if (!Arg->getType()->isPointerTy())
-          continue;
-        MemoryLocation ArgLoc =
-            MemoryLocation::getForArgument(Call, ArgIdx, nullptr);
-        ModRefInfo ArgMask = AA.getArgModRefInfo(Call, ArgIdx);
-        ArgMask &= CallMask;
-        if (!isNoModRef(ArgMask))
-          addMemoryLocation(ArgLoc, ArgMask);
-      }
+      addArgMemLocations(Call, /*StripAATags=*/false);
       return;
     }
 
