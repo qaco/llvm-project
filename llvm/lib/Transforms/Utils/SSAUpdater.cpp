@@ -361,15 +361,29 @@ LoadAndStorePromoter(ArrayRef<const Instruction *> Insts,
                      SSAUpdater &S, StringRef BaseName) : SSA(S) {
   if (Insts.empty()) return;
 
-  const Value *SomeVal;
-  if (const LoadInst *LI = dyn_cast<LoadInst>(Insts[0]))
-    SomeVal = LI;
-  else
-    SomeVal = cast<StoreInst>(Insts[0])->getOperand(0);
+  // Instruction::getAccessType() already knows every load/store shape this
+  // class can promote, so the type needs no special casing here.
+  Type *PromotedTy = Insts[0]->getAccessType();
+  assert(PromotedTy && "Expected an access to a promotable location");
 
-  if (BaseName.empty())
+  if (BaseName.empty()) {
+    // Name the inserted PHIs after the value that flows through the location:
+    // a read is that value, a write takes it as its first operand.
+    const Value *SomeVal = Insts[0];
+    if (SomeVal->getType()->isVoidTy())
+      SomeVal = Insts[0]->getOperand(0);
     BaseName = SomeVal->getName();
-  SSA.Initialize(SomeVal->getType(), BaseName);
+  }
+  SSA.Initialize(PromotedTy, BaseName);
+}
+
+Value *LoadAndStorePromoter::getStoredValue(Instruction *I) const {
+  if (auto *SI = dyn_cast<StoreInst>(I))
+    return SI->getValueOperand();
+  // An alloca is treated as a store of getValueToUseForAlloca's value.
+  if (auto *AI = dyn_cast<AllocaInst>(I))
+    return getValueToUseForAlloca(AI);
+  return nullptr;
 }
 
 void LoadAndStorePromoter::run(const SmallVectorImpl<Instruction *> &Insts) {
@@ -384,7 +398,7 @@ void LoadAndStorePromoter::run(const SmallVectorImpl<Instruction *> &Insts) {
   // Okay, now we can iterate over all the blocks in the function with uses,
   // processing them.  Keep track of which loads are loading a live-in value.
   // Walk the uses in the use-list order to be determinstic.
-  SmallVector<LoadInst *, 32> LiveInLoads;
+  SmallVector<Instruction *, 32> LiveInLoads;
   DenseMap<Value *, Value *> ReplacedLoads;
 
   for (Instruction *User : Insts) {
@@ -397,16 +411,14 @@ void LoadAndStorePromoter::run(const SmallVectorImpl<Instruction *> &Insts) {
     // Okay, this is the first use in the block.  If this block just has a
     // single user in it, we can rewrite it trivially.
     if (BlockUses.size() == 1) {
-      // If it is a store, it is a trivial def of the value in the block.
-      if (StoreInst *SI = dyn_cast<StoreInst>(User)) {
-        updateDebugInfo(SI);
-        SSA.AddAvailableValue(BB, SI->getOperand(0));
-      } else if (auto *AI = dyn_cast<AllocaInst>(User)) {
-        // We treat AllocaInst as a store of an getValueToUseForAlloca value.
-        SSA.AddAvailableValue(BB, getValueToUseForAlloca(AI));
+      // If it defines the value, it is a trivial def of the value in the
+      // block.
+      if (Value *StoredValue = getStoredValue(User)) {
+        updateDebugInfo(User);
+        SSA.AddAvailableValue(BB, StoredValue);
       } else {
         // Otherwise it is a load, queue it to rewrite as a live-in load.
-        LiveInLoads.push_back(cast<LoadInst>(User));
+        LiveInLoads.push_back(User);
       }
       BlockUses.clear();
       continue;
@@ -415,7 +427,7 @@ void LoadAndStorePromoter::run(const SmallVectorImpl<Instruction *> &Insts) {
     // Otherwise, check to see if this block is all loads.
     bool HasStore = false;
     for (Instruction *I : BlockUses) {
-      if (isa<StoreInst>(I) || isa<AllocaInst>(I)) {
+      if (getStoredValue(I)) {
         HasStore = true;
         break;
       }
@@ -423,8 +435,7 @@ void LoadAndStorePromoter::run(const SmallVectorImpl<Instruction *> &Insts) {
 
     // If so, we can queue them all as live in loads.
     if (!HasStore) {
-      for (Instruction *I : BlockUses)
-        LiveInLoads.push_back(cast<LoadInst>(I));
+      llvm::append_range(LiveInLoads, BlockUses);
       BlockUses.clear();
       continue;
     }
@@ -442,31 +453,25 @@ void LoadAndStorePromoter::run(const SmallVectorImpl<Instruction *> &Insts) {
     // the live out value.
     Value *StoredValue = nullptr;
     for (Instruction *I : BlockUses) {
-      if (LoadInst *L = dyn_cast<LoadInst>(I)) {
-        // If we haven't seen a store yet, this is a live in use, otherwise
-        // use the stored value.
-        if (StoredValue) {
-          replaceLoadWithValue(L, StoredValue);
-          // Avoid assertions in unreachable code.
-          if (StoredValue == L)
-            StoredValue = PoisonValue::get(L->getType());
-          L->replaceAllUsesWith(StoredValue);
-          ReplacedLoads[L] = StoredValue;
-        } else {
-          LiveInLoads.push_back(L);
-        }
+      if (Value *NewStoredValue = getStoredValue(I)) {
+        updateDebugInfo(I);
+
+        // Remember that this is the active value in the block.
+        StoredValue = NewStoredValue;
         continue;
       }
 
-      if (StoreInst *SI = dyn_cast<StoreInst>(I)) {
-        updateDebugInfo(SI);
-
-        // Remember that this is the active value in the block.
-        StoredValue = SI->getOperand(0);
-      } else if (auto *AI = dyn_cast<AllocaInst>(I)) {
-        // Check if this an alloca, in which case we treat it as a store of
-        // getValueToUseForAlloca.
-        StoredValue = getValueToUseForAlloca(AI);
+      // If we haven't seen a store yet, this is a live in use, otherwise
+      // use the stored value.
+      if (StoredValue) {
+        replaceLoadWithValue(I, StoredValue);
+        // Avoid assertions in unreachable code.
+        if (StoredValue == I)
+          StoredValue = PoisonValue::get(I->getType());
+        I->replaceAllUsesWith(StoredValue);
+        ReplacedLoads[I] = StoredValue;
+      } else {
+        LiveInLoads.push_back(I);
       }
     }
 
@@ -478,7 +483,7 @@ void LoadAndStorePromoter::run(const SmallVectorImpl<Instruction *> &Insts) {
 
   // Okay, now we rewrite all loads that use live-in values in the loop,
   // inserting PHI nodes as necessary.
-  for (LoadInst *ALoad : LiveInLoads) {
+  for (Instruction *ALoad : LiveInLoads) {
     Value *NewVal = SSA.GetValueInMiddleOfBlock(ALoad->getParent());
     replaceLoadWithValue(ALoad, NewVal);
 
@@ -514,7 +519,7 @@ void LoadAndStorePromoter::run(const SmallVectorImpl<Instruction *> &Insts) {
         RLI = ReplacedLoads.find(NewVal);
       }
 
-      replaceLoadWithValue(cast<LoadInst>(User), NewVal);
+      replaceLoadWithValue(User, NewVal);
       User->replaceAllUsesWith(NewVal);
     }
 

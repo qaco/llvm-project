@@ -167,8 +167,14 @@ public:
   virtual void doExtraRewritesBeforeFinalDeletion() {}
 
   /// Clients can choose to implement this to get notified right before
-  /// a load is RAUW'd another value.
-  virtual void replaceLoadWithValue(LoadInst *LI, Value *V) const {}
+  /// a load is RAUW'd another value. \p I is an instruction that reads the
+  /// promoted location, that is, one for which getStoredValue() returns null.
+  virtual void replaceLoadWithValue(Instruction *I, Value *V) const {}
+
+  /// Return the value \p I stores to the promoted location, or null if \p I
+  /// only reads it. Clients override this to promote accesses that are not
+  /// plain LoadInst / StoreInst.
+  LLVM_ABI virtual Value *getStoredValue(Instruction *I) const;
 
   /// Called before each instruction is deleted.
   virtual void instructionDeleted(Instruction *I) const {}
