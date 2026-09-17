@@ -241,21 +241,14 @@ MemoryLocation MemoryLocation::getForArgument(const CallBase *Call,
               cast<ConstantInt>(II->getArgOperand(0))->getZExtValue()),
           AATags);
 
-    case Intrinsic::masked_load: {
-      assert(ArgIdx == 0 && "Invalid argument index");
-
-      auto *Ty = cast<VectorType>(II->getType());
-      if (auto KnownType = getKnownTypeFromMaskedOp(II->getOperand(1), Ty))
-        return MemoryLocation(Arg, DL.getTypeStoreSize(*KnownType), AATags);
-
-      return MemoryLocation(
-          Arg, LocationSize::upperBound(DL.getTypeStoreSize(Ty)), AATags);
-    }
+    case Intrinsic::masked_load:
     case Intrinsic::masked_store: {
-      assert(ArgIdx == 1 && "Invalid argument index");
+      const auto *MI = cast<MaskedLoadStoreIntrinsic>(II);
+      assert(ArgIdx == MI->getPointerOperandIndex() &&
+             "Invalid argument index");
 
-      auto *Ty = cast<VectorType>(II->getArgOperand(0)->getType());
-      if (auto KnownType = getKnownTypeFromMaskedOp(II->getOperand(2), Ty))
+      auto *Ty = cast<VectorType>(MI->getAccessType());
+      if (auto KnownType = getKnownTypeFromMaskedOp(MI->getMask(), Ty))
         return MemoryLocation(Arg, DL.getTypeStoreSize(*KnownType), AATags);
 
       return MemoryLocation(

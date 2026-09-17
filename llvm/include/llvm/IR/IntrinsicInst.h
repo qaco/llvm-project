@@ -1356,6 +1356,51 @@ public:
   }
 };
 
+/// This class represents the llvm.masked.load and llvm.masked.store
+/// intrinsics, which read or write a contiguous vector of memory under a
+/// per-lane predicate.
+class MaskedLoadStoreIntrinsic : public IntrinsicInst {
+public:
+  /// Whether this is a masked store rather than a masked load.
+  bool isStore() const { return getIntrinsicID() == Intrinsic::masked_store; }
+
+  /// The pointer operand is the first argument of a load and the second of a
+  /// store, which takes the stored value first. This cannot be static: the
+  /// index depends on which of the two intrinsics this is.
+  unsigned getPointerOperandIndex() const { return isStore() ? 1 : 0; }
+  Value *getPointerOperand() const {
+    return getArgOperand(getPointerOperandIndex());
+  }
+
+  /// The <N x i1> predicate selecting the lanes that are accessed.
+  Value *getMask() const { return getArgOperand(isStore() ? 2 : 1); }
+
+  /// The value written by a masked store, or null for a masked load. Callers
+  /// rely on the null to tell a write from a read.
+  Value *getValueOperand() const {
+    return isStore() ? getArgOperand(0) : nullptr;
+  }
+
+  /// The alignment of the pointer operand, which is carried as a parameter
+  /// attribute rather than an operand.
+  Align getAlign() const {
+    return getParamAlign(getPointerOperandIndex()).valueOrOne();
+  }
+
+  static bool classof(const IntrinsicInst *I) {
+    switch (I->getIntrinsicID()) {
+    case Intrinsic::masked_load:
+    case Intrinsic::masked_store:
+      return true;
+    default:
+      return false;
+    }
+  }
+  static bool classof(const Value *V) {
+    return isa<IntrinsicInst>(V) && classof(cast<IntrinsicInst>(V));
+  }
+};
+
 /// This represents the llvm.va_start intrinsic.
 class VAStartInst : public IntrinsicInst {
 public:
