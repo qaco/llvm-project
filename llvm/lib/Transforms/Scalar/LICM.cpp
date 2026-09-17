@@ -1850,6 +1850,68 @@ static bool isSafeToExecuteUnconditionally(
 }
 
 namespace {
+
+/// An access that promoteLoopAccessesToScalars() knows how to promote: a plain
+/// load or store, or a masked one. Describing both through one struct keeps
+/// the promotion policy from being written twice.
+struct PromotableAccess {
+  /// The location accessed.
+  Value *Ptr;
+  /// Operand number of \p Ptr, so that uses of the pointer as a plain value
+  /// can be told apart from accesses through it.
+  unsigned PtrOpNo;
+  /// Type of the value loaded or stored, ignoring the mask.
+  Type *Ty;
+  Align Alignment;
+  /// The lanes accessed, or null for a plain access. This is also how the
+  /// promoter tells the two kinds apart.
+  Value *Mask;
+  bool IsWrite;
+  bool IsAtomic;
+  bool IsUnordered;
+  /// True for an atomic access stronger than monotonic, which cannot take part
+  /// in promotion at all.
+  bool HasStrongOrdering;
+};
+
+// Instruction::getAccessType() supplies Ty for all four kinds, but it also
+// answers for gathers, scatters and the VP intrinsics, which this pass does
+// not promote -- so the kind is still matched explicitly here.
+std::optional<PromotableAccess> getPromotableAccess(Instruction *I) {
+  if (auto *LI = dyn_cast<LoadInst>(I))
+    return PromotableAccess{LI->getPointerOperand(),
+                            LoadInst::getPointerOperandIndex(),
+                            I->getAccessType(),
+                            LI->getAlign(),
+                            /*Mask=*/nullptr,
+                            /*IsWrite=*/false,
+                            LI->isAtomic(),
+                            LI->isUnordered(),
+                            isStrongerThanMonotonic(LI->getOrdering())};
+  if (auto *SI = dyn_cast<StoreInst>(I))
+    return PromotableAccess{SI->getPointerOperand(),
+                            StoreInst::getPointerOperandIndex(),
+                            I->getAccessType(),
+                            SI->getAlign(),
+                            /*Mask=*/nullptr,
+                            /*IsWrite=*/true,
+                            SI->isAtomic(),
+                            SI->isUnordered(),
+                            isStrongerThanMonotonic(SI->getOrdering())};
+  // Masked intrinsics are calls, so they are never atomic or volatile.
+  if (auto *MI = dyn_cast<MaskedLoadStoreIntrinsic>(I))
+    return PromotableAccess{MI->getPointerOperand(),
+                            MI->getPointerOperandIndex(),
+                            I->getAccessType(),
+                            MI->getAlign(),
+                            MI->getMask(),
+                            MI->isStore(),
+                            /*IsAtomic=*/false,
+                            /*IsUnordered=*/true,
+                            /*HasStrongOrdering=*/false};
+  return std::nullopt;
+}
+
 class LoopPromoter : public LoadAndStorePromoter {
   Value *SomePtr; // Designated pointer to store to.
   SmallVectorImpl<BasicBlock *> &LoopExitBlocks;
@@ -1865,6 +1927,8 @@ class LoopPromoter : public LoadAndStorePromoter {
   ICFLoopSafetyInfo &SafetyInfo;
   bool CanInsertStoresInExitBlocks;
   ArrayRef<const Instruction *> Uses;
+  // The mask the promoted accesses share, or null when they are plain.
+  Value *Mask;
 
   // We're about to add a use of V in a loop exit block.  Insert an LCSSA phi
   // (if legal) if doing so would add an out-of-loop use to an instruction
@@ -1891,13 +1955,15 @@ public:
                SmallVectorImpl<MemoryAccess *> &MSSAIP, PredIteratorCache &PIC,
                MemorySSAUpdater &MSSAU, LoopInfo &li, DebugLoc dl,
                Align Alignment, bool UnorderedAtomic, const AAMDNodes &AATags,
-               ICFLoopSafetyInfo &SafetyInfo, bool CanInsertStoresInExitBlocks)
+               ICFLoopSafetyInfo &SafetyInfo, bool CanInsertStoresInExitBlocks,
+               Value *Mask)
       : LoadAndStorePromoter(Insts, S), SomePtr(SP), LoopExitBlocks(LEB),
         LoopInsertPts(LIP), MSSAInsertPts(MSSAIP), PredCache(PIC), MSSAU(MSSAU),
         LI(li), DL(std::move(dl)), Alignment(Alignment),
         UnorderedAtomic(UnorderedAtomic), AATags(AATags),
         SafetyInfo(SafetyInfo),
-        CanInsertStoresInExitBlocks(CanInsertStoresInExitBlocks), Uses(Insts) {}
+        CanInsertStoresInExitBlocks(CanInsertStoresInExitBlocks), Uses(Insts),
+        Mask(Mask) {}
 
   void insertStoresInLoopExitBlocks() {
     // Insert stores after in the loop exit blocks.  Each exit block gets a
@@ -1911,10 +1977,18 @@ public:
       LiveInValue = maybeInsertLCSSAPHI(LiveInValue, ExitBlock);
       Value *Ptr = maybeInsertLCSSAPHI(SomePtr, ExitBlock);
       BasicBlock::iterator InsertPos = LoopInsertPts[i];
-      StoreInst *NewSI = new StoreInst(LiveInValue, Ptr, InsertPos);
-      if (UnorderedAtomic)
-        NewSI->setOrdering(AtomicOrdering::Unordered);
-      NewSI->setAlignment(Alignment);
+      Instruction *NewSI;
+      if (Mask) {
+        IRBuilder<> Builder(InsertPos->getParent(), InsertPos);
+        NewSI = Builder.CreateMaskedStore(LiveInValue, Ptr, Alignment,
+                                          maybeInsertLCSSAPHI(Mask, ExitBlock));
+      } else {
+        auto *Plain = new StoreInst(LiveInValue, Ptr, InsertPos);
+        if (UnorderedAtomic)
+          Plain->setOrdering(AtomicOrdering::Unordered);
+        Plain->setAlignment(Alignment);
+        NewSI = Plain;
+      }
       NewSI->setDebugLoc(DL);
       // Attach DIAssignID metadata to the new store, generating it on the
       // first loop iteration.
@@ -1960,9 +2034,13 @@ public:
   }
 
   bool shouldDelete(Instruction *I) const override {
-    if (isa<StoreInst>(I))
-      return CanInsertStoresInExitBlocks;
-    return true;
+    return getStoredValue(I) ? CanInsertStoresInExitBlocks : true;
+  }
+
+  Value *getStoredValue(Instruction *I) const override {
+    if (auto *MI = dyn_cast<MaskedLoadStoreIntrinsic>(I))
+      return MI->getValueOperand(); // Null for a masked load.
+    return LoadAndStorePromoter::getStoredValue(I);
   }
 };
 
@@ -2111,6 +2189,7 @@ bool llvm::promoteLoopAccessesToScalars(
   // We cannot (yet) promote a memory location that is loaded and stored in
   // different sizes.  While we are at it, collect alignment and AA info.
   Type *AccessTy = nullptr;
+  Value *Mask = nullptr;
   for (Value *ASIV : PointerMustAliases) {
     for (Use &U : ASIV->uses()) {
       // Ignore instructions that are outside the loop.
@@ -2118,17 +2197,25 @@ bool llvm::promoteLoopAccessesToScalars(
       if (!UI || !CurLoop->contains(UI))
         continue;
 
-      // If there is an non-load/store instruction in the loop, we can't promote
-      // it.
-      if (LoadInst *Load = dyn_cast<LoadInst>(UI)) {
-        if (!Load->isUnordered())
-          return false;
+      // Skip whatever this pass does not model; the aliasing checks above have
+      // already decided that doing so is safe.
+      std::optional<PromotableAccess> Acc = getPromotableAccess(UI);
+      if (!Acc)
+        continue;
 
-        SawUnorderedAtomic |= Load->isAtomic();
-        SawNotAtomic |= !Load->isAtomic();
+      // Uses *of* the pointer as a plain value are not interesting, only
+      // accesses *through* it.
+      if (U.getOperandNo() != Acc->PtrOpNo)
+        continue;
+
+      if (!Acc->IsUnordered)
+        return false;
+
+      SawUnorderedAtomic |= Acc->IsAtomic;
+      SawNotAtomic |= !Acc->IsAtomic;
+
+      if (!Acc->IsWrite) {
         FoundLoadToPromote = true;
-
-        Align InstAlignment = Load->getAlign();
 
         if (!LoadIsGuaranteedToExecute)
           LoadIsGuaranteedToExecute =
@@ -2138,30 +2225,25 @@ bool llvm::promoteLoopAccessesToScalars(
         // sufficient alignment at the target location.  Proving it guaranteed
         // to execute does as well.  Thus we can increase our guaranteed
         // alignment as well.
-        if (!DereferenceableInPH || (InstAlignment > Alignment))
-          if (isSafeToExecuteUnconditionally(
-                  *Load, DT, TLI, CurLoop, SafetyInfo, ORE,
-                  Preheader->getTerminator(), AC, AllowSpeculation)) {
+        //
+        // A masked load is a call and so is never speculatable; for it, only
+        // executing on every path proves the location dereferenceable in the
+        // preheader.
+        if (!DereferenceableInPH || (Acc->Alignment > Alignment))
+          if (Acc->Mask ? SafetyInfo->isGuaranteedToExecute(*UI, DT, CurLoop)
+                        : isSafeToExecuteUnconditionally(
+                              *UI, DT, TLI, CurLoop, SafetyInfo, ORE,
+                              Preheader->getTerminator(), AC,
+                              AllowSpeculation)) {
             DereferenceableInPH = true;
-            Alignment = std::max(Alignment, InstAlignment);
+            Alignment = std::max(Alignment, Acc->Alignment);
           }
-      } else if (const StoreInst *Store = dyn_cast<StoreInst>(UI)) {
-        // Stores *of* the pointer are not interesting, only stores *to* the
-        // pointer.
-        if (U.getOperandNo() != StoreInst::getPointerOperandIndex())
-          continue;
-        if (!Store->isUnordered())
-          return false;
-
-        SawUnorderedAtomic |= Store->isAtomic();
-        SawNotAtomic |= !Store->isAtomic();
-
+      } else {
         // If the store is guaranteed to execute, both properties are satisfied.
         // We may want to check if a store is guaranteed to execute even if we
         // already know that promotion is safe, since it may have higher
         // alignment than any other guaranteed stores, in which case we can
         // raise the alignment on the promoted store.
-        Align InstAlignment = Store->getAlign();
         bool GuaranteedToExecute =
             SafetyInfo->isGuaranteedToExecute(*UI, DT, CurLoop);
         StoreIsGuaranteedToExecute |= GuaranteedToExecute;
@@ -2169,7 +2251,7 @@ bool llvm::promoteLoopAccessesToScalars(
           DereferenceableInPH = true;
           if (StoreSafety == StoreSafetyUnknown)
             StoreSafety = StoreSafe;
-          Alignment = std::max(Alignment, InstAlignment);
+          Alignment = std::max(Alignment, Acc->Alignment);
         }
 
         // If a store dominates all exit blocks, it is safe to sink.
@@ -2180,24 +2262,27 @@ bool llvm::promoteLoopAccessesToScalars(
         // start sinking stores into unwind edges (see above), this will break.
         if (StoreSafety == StoreSafetyUnknown &&
             llvm::all_of(ExitBlocks, [&](BasicBlock *Exit) {
-              return DT->dominates(Store->getParent(), Exit);
+              return DT->dominates(UI->getParent(), Exit);
             }))
           StoreSafety = StoreSafe;
 
-        // If the store is not guaranteed to execute, we may still get
-        // deref info through it.
-        if (!DereferenceableInPH) {
+        // If the store is not guaranteed to execute, we may still get deref
+        // info through it. Masked stores are left out: asking about their full
+        // vector type would be sound but stricter than the lanes they actually
+        // write, so this is better done with the mask taken into account.
+        if (!DereferenceableInPH && !Acc->Mask)
           DereferenceableInPH = isDereferenceableAndAlignedPointer(
-              Store->getPointerOperand(), Store->getValueOperand()->getType(),
-              Store->getAlign(),
+              Acc->Ptr, Acc->Ty, Acc->Alignment,
               SimplifyQuery(MDL, TLI, DT, AC, Preheader->getTerminator()));
-        }
-      } else
-        continue; // Not a load or store.
+      }
 
-      if (!AccessTy)
-        AccessTy = getLoadStoreType(UI);
-      else if (AccessTy != getLoadStoreType(UI))
+      // Every access in the set must have the same type and cover exactly the
+      // same lanes: one promoted value cannot stand in for accesses of
+      // different widths, nor for accesses touching different lanes.
+      if (!AccessTy) {
+        AccessTy = Acc->Ty;
+        Mask = Acc->Mask;
+      } else if (AccessTy != Acc->Ty || Mask != Acc->Mask)
         return false;
 
       // Merge the AA tags.
@@ -2285,18 +2370,27 @@ bool llvm::promoteLoopAccessesToScalars(
                         MSSAInsertPts, PIC, MSSAU, *LI, DL, Alignment,
                         SawUnorderedAtomic,
                         StoreIsGuaranteedToExecute ? AATags : AAMDNodes(),
-                        *SafetyInfo, StoreSafety == StoreSafe);
+                        *SafetyInfo, StoreSafety == StoreSafe, Mask);
 
   // Set up the preheader to have a definition of the value.  It is the live-out
   // value from the preheader that uses in the loop will use.
-  LoadInst *PreheaderLoad = nullptr;
+  Instruction *PreheaderLoad = nullptr;
   if (FoundLoadToPromote || !StoreIsGuaranteedToExecute) {
-    PreheaderLoad =
-        new LoadInst(AccessTy, SomePtr, SomePtr->getName() + ".promoted",
-                     Preheader->getTerminator()->getIterator());
-    if (SawUnorderedAtomic)
-      PreheaderLoad->setOrdering(AtomicOrdering::Unordered);
-    PreheaderLoad->setAlignment(Alignment);
+    if (Mask) {
+      IRBuilder<> Builder(Preheader->getTerminator());
+      PreheaderLoad =
+          Builder.CreateMaskedLoad(AccessTy, SomePtr, Alignment, Mask,
+                                   /*PassThru=*/nullptr,
+                                   SomePtr->getName() + ".promoted");
+    } else {
+      auto *Plain =
+          new LoadInst(AccessTy, SomePtr, SomePtr->getName() + ".promoted",
+                       Preheader->getTerminator()->getIterator());
+      if (SawUnorderedAtomic)
+        Plain->setOrdering(AtomicOrdering::Unordered);
+      Plain->setAlignment(Alignment);
+      PreheaderLoad = Plain;
+    }
     PreheaderLoad->setDebugLoc(DebugLoc::getDropped());
     if (AATags && LoadIsGuaranteedToExecute)
       PreheaderLoad->setAAMetadata(AATags);
@@ -2343,29 +2437,24 @@ collectPromotionCandidates(MemorySSA *MSSA, AliasAnalysis *AA,
   BatchAAResults BatchAA(*AA);
   AliasSetTracker AST(BatchAA);
 
-  auto IsPotentiallyPromotable = [L](const Instruction *I) {
-    if (const auto *SI = dyn_cast<StoreInst>(I)) {
-      const Value *PtrOp = SI->getPointerOperand();
-      if (isStrongerThanMonotonic(SI->getOrdering()))
-        return false;
-      return !isa<ConstantData>(PtrOp) && L->isLoopInvariant(PtrOp);
-    }
-    if (const auto *LI = dyn_cast<LoadInst>(I)) {
-      const Value *PtrOp = LI->getPointerOperand();
-      if (isStrongerThanMonotonic(LI->getOrdering()))
-        return false;
-      return !isa<ConstantData>(PtrOp) && L->isLoopInvariant(PtrOp);
-    }
-    return false;
+  auto IsPotentiallyPromotable = [L](const PromotableAccess &Acc) {
+    if (Acc.HasStrongOrdering)
+      return false;
+    // A masked access is promotable on the same terms as a plain one, plus an
+    // invariant mask: the set of live lanes must not vary across iterations,
+    // or one load/store pair could not stand in for the loop's accesses.
+    if (Acc.Mask && !L->isLoopInvariant(Acc.Mask))
+      return false;
+    return !isa<ConstantData>(Acc.Ptr) && L->isLoopInvariant(Acc.Ptr);
   };
 
   // Populate AST with potentially promotable accesses.
   SmallPtrSet<Value *, 16> AttemptingPromotion;
   foreachMemoryAccess(MSSA, L, [&](Instruction *I) {
-    if (IsPotentiallyPromotable(I)) {
+    std::optional<PromotableAccess> Acc = getPromotableAccess(I);
+    if (Acc && IsPotentiallyPromotable(*Acc)) {
       AttemptingPromotion.insert(I);
-      if (StoreInst *SI = dyn_cast<StoreInst>(I);
-          SI && !SafetyInfo->isGuaranteedToExecute(*SI, DT, L)) {
+      if (Acc->IsWrite && !SafetyInfo->isGuaranteedToExecute(*I, DT, L)) {
         // Promotion requires inserting a new store at the loop exits; we need
         // to prove that store doesn't alias anything, in addition to proving
         // aliasing for the stores we're removing. The new store is executed
@@ -2376,7 +2465,7 @@ collectPromotionCandidates(MemorySSA *MSSA, AliasAnalysis *AA,
         // cases. isGuaranteedToExecute() is stronger than what we need.
         // We only need to prove that every exit from the loop is dominated
         // by a store to the same location with the same AA tag.
-        AST.addWithoutAATags(SI);
+        AST.addWithoutAATags(I);
       } else {
         AST.add(I);
       }
