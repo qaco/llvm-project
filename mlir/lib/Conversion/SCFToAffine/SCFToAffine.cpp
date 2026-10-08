@@ -21,7 +21,9 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/Support/LLVM.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/TypeSwitch.h"
 
 namespace mlir {
 #define GEN_PASS_DEF_RAISESCFTOAFFINEPASS
@@ -183,6 +185,7 @@ LogicalResult ForOpRewrite::matchAndRewrite(scf::ForOp op,
     castBoundsToIndex(op, rewriter);
 
   auto [affineFor, oldIV] = createAffineFor(op, rewriter);
+  affineFor->setDiscardableAttrs(op->getDiscardableAttrDictionary());
   Block *affineBody = affineFor.getBody();
 
   if (affineBody->mightHaveTerminator()) {
@@ -366,6 +369,270 @@ void ForOpRewrite::castBoundsToIndex(scf::ForOp loop,
 }
 
 //===----------------------------------------------------------------------===//
+// ParallelOpRewrite
+//===----------------------------------------------------------------------===//
+
+/// Map a single-operation reduction combiner to its `arith` atomic kind.
+static std::optional<arith::AtomicRMWKind> matchCombinerKind(Operation *op) {
+  return llvm::TypeSwitch<Operation *, std::optional<arith::AtomicRMWKind>>(op)
+      .Case([](arith::AddFOp) { return arith::AtomicRMWKind::addf; })
+      .Case([](arith::MulFOp) { return arith::AtomicRMWKind::mulf; })
+      .Case([](arith::AddIOp) { return arith::AtomicRMWKind::addi; })
+      .Case([](arith::MulIOp) { return arith::AtomicRMWKind::muli; })
+      .Case([](arith::AndIOp) { return arith::AtomicRMWKind::andi; })
+      .Case([](arith::OrIOp) { return arith::AtomicRMWKind::ori; })
+      .Case([](arith::XOrIOp) { return arith::AtomicRMWKind::xori; })
+      .Case([](arith::MinSIOp) { return arith::AtomicRMWKind::mins; })
+      .Case([](arith::MaxSIOp) { return arith::AtomicRMWKind::maxs; })
+      .Case([](arith::MinUIOp) { return arith::AtomicRMWKind::minu; })
+      .Case([](arith::MaxUIOp) { return arith::AtomicRMWKind::maxu; })
+      .Case([](arith::MinimumFOp) { return arith::AtomicRMWKind::minimumf; })
+      .Case([](arith::MaximumFOp) { return arith::AtomicRMWKind::maximumf; })
+      .Case([](arith::MinNumFOp) { return arith::AtomicRMWKind::minnumf; })
+      .Case([](arith::MaxNumFOp) { return arith::AtomicRMWKind::maxnumf; })
+      .Default([](Operation *) { return std::nullopt; });
+}
+
+/// Return the affine dimension/symbol expression standing for `v` in a map
+/// whose operands are `dims` followed by `symbols`, appending `v` to the right
+/// list on first use. Returns a null expression if `v` is neither a valid
+/// affine dimension nor symbol in `scope`.
+static AffineExpr getAffineExprForValue(Value v, Region *scope,
+                                        OpBuilder &builder,
+                                        SmallVectorImpl<Value> &dims,
+                                        SmallVectorImpl<Value> &symbols,
+                                        DenseMap<Value, AffineExpr> &exprOf) {
+  if (AffineExpr known = exprOf.lookup(v))
+    return known;
+  AffineExpr e;
+  if (affine::isValidDim(v, scope)) {
+    e = builder.getAffineDimExpr(dims.size());
+    dims.push_back(v);
+  } else if (affine::isValidSymbol(v, scope)) {
+    e = builder.getAffineSymbolExpr(symbols.size());
+    symbols.push_back(v);
+  }
+  if (e)
+    exprOf[v] = e;
+  return e;
+}
+
+/// Express each of `bounds` (one per loop dimension) as an affine map over a
+/// single shared operand list, as required by `affine.parallel`. An
+/// `affine.min` (`isUpper`) or `affine.max` (lower) bound is folded into its
+/// dimension's map. Returns failure if any bound is not a valid affine
+/// quantity.
+static bool alignParallelBounds(ValueRange bounds, bool isUpper, Region *scope,
+                                OpBuilder &builder,
+                                SmallVectorImpl<AffineMap> &maps,
+                                SmallVectorImpl<Value> &operands) {
+  SmallVector<Value> dims, symbols;
+  DenseMap<Value, AffineExpr> exprOf;
+
+  // Collect per-dimension result expressions first: every bound map must share
+  // the final dims/symbols space, which is only known once all are seen.
+  SmallVector<SmallVector<AffineExpr>> perDim;
+  for (Value bound : bounds) {
+    Operation *def = bound.getDefiningOp();
+    bool isMinMax = isUpper ? isa_and_nonnull<affine::AffineMinOp>(def)
+                            : isa_and_nonnull<affine::AffineMaxOp>(def);
+    SmallVector<AffineExpr> results;
+    if (isMinMax) {
+      AffineMap map = isUpper ? cast<affine::AffineMinOp>(def).getAffineMap()
+                              : cast<affine::AffineMaxOp>(def).getAffineMap();
+      ValueRange minMaxOperands = def->getOperands();
+      unsigned numDims = map.getNumDims();
+      SmallVector<AffineExpr> dimRepl, symRepl;
+      for (unsigned i = 0; i < numDims; ++i)
+        if (AffineExpr r = getAffineExprForValue(
+                minMaxOperands[i], scope, builder, dims, symbols, exprOf))
+          dimRepl.push_back(r);
+        else
+          return false;
+      for (unsigned i = 0, e = map.getNumSymbols(); i < e; ++i)
+        if (AffineExpr r =
+                getAffineExprForValue(minMaxOperands[numDims + i], scope,
+                                      builder, dims, symbols, exprOf))
+          symRepl.push_back(r);
+        else
+          return false;
+      for (AffineExpr result : map.getResults())
+        results.push_back(result.replaceDimsAndSymbols(dimRepl, symRepl));
+    } else if (AffineExpr e = getAffineExprForValue(bound, scope, builder, dims,
+                                                    symbols, exprOf)) {
+      results.push_back(e);
+    } else {
+      return false;
+    }
+    perDim.push_back(std::move(results));
+  }
+
+  for (SmallVector<AffineExpr> &results : perDim)
+    maps.push_back(AffineMap::get(dims.size(), symbols.size(), results,
+                                  builder.getContext()));
+  operands.assign(dims.begin(), dims.end());
+  llvm::append_range(operands, symbols);
+  return true;
+}
+
+/// Raise an `scf.parallel` to an equivalent `affine.parallel`. Requires every
+/// bound to be a valid affine dimension/symbol (or an `affine.min`/`affine.max`
+/// over such), a constant step per dimension, and any reduction to be a
+/// single recognized `arith` combiner initialized to that combiner's neutral
+/// element.
+struct ParallelOpRewrite : public OpRewritePattern<scf::ParallelOp> {
+  using OpRewritePattern<scf::ParallelOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(scf::ParallelOp op,
+                                PatternRewriter &rewriter) const override {
+    Region *scope = affine::getAffineScope(op);
+    if (!scope)
+      return failure();
+
+    SmallVector<int64_t> steps;
+    for (Value step : op.getStep()) {
+      IntegerAttr stepAttr;
+      if (!matchPattern(step, m_Constant(&stepAttr)))
+        return rewriter.notifyMatchFailure(op, "non-constant step");
+      steps.push_back(stepAttr.getInt());
+    }
+
+    auto reduceOp = cast<scf::ReduceOp>(op.getBody()->getTerminator());
+    SmallVector<arith::AtomicRMWKind> reductionKinds;
+    for (unsigned i = 0, e = op.getNumReductions(); i < e; ++i) {
+      Block &combinerBlock = reduceOp.getReductions()[i].front();
+      if (combinerBlock.getOperations().size() != 2)
+        return rewriter.notifyMatchFailure(op,
+                                           "non-trivial reduction combiner");
+      auto ret = cast<scf::ReduceReturnOp>(combinerBlock.getTerminator());
+      Operation *combiner = ret.getResult().getDefiningOp();
+      Value lhs = combinerBlock.getArgument(0);
+      Value rhs = combinerBlock.getArgument(1);
+      if (!combiner || combiner->getBlock() != &combinerBlock ||
+          combiner->getNumOperands() != 2 ||
+          !((combiner->getOperand(0) == lhs &&
+             combiner->getOperand(1) == rhs) ||
+            (combiner->getOperand(0) == rhs && combiner->getOperand(1) == lhs)))
+        return rewriter.notifyMatchFailure(op,
+                                           "unsupported reduction combiner");
+      std::optional<arith::AtomicRMWKind> kind = matchCombinerKind(combiner);
+      if (!kind)
+        return rewriter.notifyMatchFailure(op, "unrecognized reduction kind");
+      // affine.parallel seeds each reduction with the kind's neutral element,
+      // so the source init must already be that element.
+      auto initConst = op.getInitVals()[i].getDefiningOp<arith::ConstantOp>();
+      std::optional<TypedAttr> neutral = arith::getNeutralElement(combiner);
+      if (!initConst || !neutral || initConst.getValue() != *neutral)
+        return rewriter.notifyMatchFailure(op, "reduction init is not neutral");
+      reductionKinds.push_back(*kind);
+    }
+
+    SmallVector<AffineMap> lbMaps, ubMaps;
+    SmallVector<Value> lbArgs, ubArgs;
+    if (!alignParallelBounds(op.getLowerBound(), /*isUpper=*/false, scope,
+                             rewriter, lbMaps, lbArgs) ||
+        !alignParallelBounds(op.getUpperBound(), /*isUpper=*/true, scope,
+                             rewriter, ubMaps, ubArgs))
+      return rewriter.notifyMatchFailure(op, "bounds are not affine");
+
+    auto affineParallel = affine::AffineParallelOp::create(
+        rewriter, op.getLoc(), op.getResultTypes(), reductionKinds, lbMaps,
+        lbArgs, ubMaps, ubArgs, steps);
+    affineParallel->setDiscardableAttrs(op->getDiscardableAttrDictionary());
+
+    Block *affineBody = affineParallel.getBody();
+    if (affineBody->mightHaveTerminator())
+      rewriter.eraseOp(affineBody->getTerminator());
+
+    rewriter.inlineBlockBefore(op.getBody(), affineBody, affineBody->end(),
+                               affineParallel.getIVs());
+
+    auto inlinedReduce = cast<scf::ReduceOp>(affineBody->getTerminator());
+    rewriter.setInsertionPointToEnd(affineBody);
+    rewriter.replaceOpWithNewOp<affine::AffineYieldOp>(
+        inlinedReduce, inlinedReduce.getOperands());
+
+    rewriter.replaceOp(op, affineParallel.getResults());
+    return success();
+  }
+};
+
+//===----------------------------------------------------------------------===//
+// SelectToAffineMinMax
+//===----------------------------------------------------------------------===//
+
+/// Raise an `arith.select` built on top of an `arith.cmpi` that implements a
+/// signed min/max idiom into an `affine.min` / `affine.max`, provided both
+/// compared values are valid affine dimensions or symbols.
+struct SelectToAffineMinMax : public OpRewritePattern<arith::SelectOp> {
+  using OpRewritePattern<arith::SelectOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(arith::SelectOp op,
+                                PatternRewriter &rewriter) const override {
+    if (!op.getType().isIndex())
+      return failure();
+
+    auto cmp = op.getCondition().getDefiningOp<arith::CmpIOp>();
+    if (!cmp)
+      return failure();
+
+    // affine.min / affine.max carry signed semantics; only signed, non-equality
+    // predicates describe a min/max.
+    bool predIsLess;
+    switch (cmp.getPredicate()) {
+    case arith::CmpIPredicate::slt:
+    case arith::CmpIPredicate::sle:
+      predIsLess = true;
+      break;
+    case arith::CmpIPredicate::sgt:
+    case arith::CmpIPredicate::sge:
+      predIsLess = false;
+      break;
+    default:
+      return failure();
+    }
+
+    Value lhs = cmp.getLhs();
+    Value rhs = cmp.getRhs();
+    bool trueIsLhs;
+    if (op.getTrueValue() == lhs && op.getFalseValue() == rhs)
+      trueIsLhs = true;
+    else if (op.getTrueValue() == rhs && op.getFalseValue() == lhs)
+      trueIsLhs = false;
+    else
+      return failure();
+
+    // `lhs < rhs ? lhs : rhs` is a min; flipping either the comparison
+    // direction or the selected operand turns it into a max.
+    bool isMin = predIsLess == trueIsLhs;
+
+    Region *scope = affine::getAffineScope(op);
+    if (!scope)
+      return failure();
+
+    SmallVector<Value> dims, symbols;
+    DenseMap<Value, AffineExpr> exprOf;
+    AffineExpr lhsExpr =
+        getAffineExprForValue(lhs, scope, rewriter, dims, symbols, exprOf);
+    AffineExpr rhsExpr =
+        getAffineExprForValue(rhs, scope, rewriter, dims, symbols, exprOf);
+    if (!lhsExpr || !rhsExpr)
+      return failure();
+
+    AffineMap map = AffineMap::get(dims.size(), symbols.size(),
+                                   {lhsExpr, rhsExpr}, rewriter.getContext());
+    SmallVector<Value> operands = std::move(dims);
+    llvm::append_range(operands, symbols);
+
+    if (isMin)
+      rewriter.replaceOpWithNewOp<affine::AffineMinOp>(op, map, operands);
+    else
+      rewriter.replaceOpWithNewOp<affine::AffineMaxOp>(op, map, operands);
+    return success();
+  }
+};
+
+//===----------------------------------------------------------------------===//
 // Pass implementation
 //===----------------------------------------------------------------------===//
 
@@ -374,7 +641,12 @@ void SCFToAffinePass::runOnOperation() {
   RewritePatternSet patterns(&ctx);
   populateSCFToAffineConversionPatterns(patterns);
 
-  (void)applyPatternsGreedily(getOperation(), std::move(patterns));
+  // Traverse top-down so a bound (e.g. an `arith.select` raised to an
+  // `affine.min` / `affine.max`) is rewritten before the loop that consumes it,
+  // letting the loop fold the bound into its affine map.
+  GreedyRewriteConfig config;
+  config.setUseTopDownTraversal(true);
+  (void)applyPatternsGreedily(getOperation(), std::move(patterns), config);
 }
 
 } // namespace
@@ -384,5 +656,6 @@ void SCFToAffinePass::runOnOperation() {
 //===----------------------------------------------------------------------===//
 
 void mlir::populateSCFToAffineConversionPatterns(RewritePatternSet &patterns) {
-  patterns.add<ForOpRewrite>(patterns.getContext());
+  patterns.add<ForOpRewrite, ParallelOpRewrite, SelectToAffineMinMax>(
+      patterns.getContext());
 }

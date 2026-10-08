@@ -368,3 +368,221 @@ module attributes {dlti.dl_spec = #dlti.dl_spec<#dlti.dl_entry<index, 32>>} {
     return
   }
 }
+
+// -----
+
+// Discardable attributes on the source loop are carried over to the raised loop.
+
+// CHECK-LABEL: @propagate_attributes
+// CHECK:         affine.for
+// CHECK:         } {my_dialect.tag = 42 : i64}
+func.func @propagate_attributes(%arr: memref<?xi32>, %lb: index, %ub: index) {
+  %c0_i32 = arith.constant 0 : i32
+  %c1 = arith.constant 1 : index
+  scf.for %idx = %lb to %ub step %c1 {
+    memref.store %c0_i32, %arr[%idx] : memref<?xi32>
+  } {my_dialect.tag = 42 : i64}
+  return
+}
+
+// -----
+
+// `select(cmpi slt a, b, a, b)` is a min; raised into the loop's upper bound.
+
+// CHECK: #[[$MAP:.+]] = affine_map<()[s0, s1] -> (s0, s1)>
+// CHECK-LABEL: @select_min_as_ub
+// CHECK-SAME:  %[[ARR:.*]]: memref<?xi32>, %[[LB:.*]]: index, %[[A:.*]]: index, %[[B:.*]]: index
+// CHECK-NOT:     arith.select
+// CHECK:         affine.for %{{.*}} = %[[LB]] to min #[[$MAP]]()[%[[A]], %[[B]]]
+func.func @select_min_as_ub(%arr: memref<?xi32>, %lb: index, %a: index, %b: index) {
+  %c0 = arith.constant 0 : i32
+  %c1 = arith.constant 1 : index
+  %c = arith.cmpi slt, %a, %b : index
+  %ub = arith.select %c, %a, %b : index
+  scf.for %i = %lb to %ub step %c1 {
+    memref.store %c0, %arr[%i] : memref<?xi32>
+  }
+  return
+}
+
+// -----
+
+// `select(cmpi sgt a, b, a, b)` is a max; raised into the loop's lower bound.
+
+// CHECK: #[[$MAP:.+]] = affine_map<()[s0, s1] -> (s0, s1)>
+// CHECK-LABEL: @select_max_as_lb
+// CHECK-SAME:  %[[ARR:.*]]: memref<?xi32>, %[[UB:.*]]: index, %[[A:.*]]: index, %[[B:.*]]: index
+// CHECK-NOT:     arith.select
+// CHECK:         affine.for %{{.*}} = max #[[$MAP]]()[%[[A]], %[[B]]] to %[[UB]]
+func.func @select_max_as_lb(%arr: memref<?xi32>, %ub: index, %a: index, %b: index) {
+  %c0 = arith.constant 0 : i32
+  %c1 = arith.constant 1 : index
+  %c = arith.cmpi sgt, %a, %b : index
+  %lb = arith.select %c, %a, %b : index
+  scf.for %i = %lb to %ub step %c1 {
+    memref.store %c0, %arr[%i] : memref<?xi32>
+  }
+  return
+}
+
+// -----
+
+// Flipping the selected operands turns `cmpi sgt` back into a min.
+
+// CHECK: #[[$MAP:.+]] = affine_map<()[s0, s1] -> (s0, s1)>
+// CHECK-LABEL: @select_min_flipped_operands
+// CHECK-SAME:  %[[ARR:.*]]: memref<?xi32>, %[[LB:.*]]: index, %[[A:.*]]: index, %[[B:.*]]: index
+// CHECK:         affine.for %{{.*}} = %[[LB]] to min #[[$MAP]]()[%[[A]], %[[B]]]
+func.func @select_min_flipped_operands(%arr: memref<?xi32>, %lb: index, %a: index, %b: index) {
+  %c0 = arith.constant 0 : i32
+  %c1 = arith.constant 1 : index
+  %c = arith.cmpi sgt, %a, %b : index
+  %ub = arith.select %c, %b, %a : index
+  scf.for %i = %lb to %ub step %c1 {
+    memref.store %c0, %arr[%i] : memref<?xi32>
+  }
+  return
+}
+
+// -----
+
+// Unsigned comparisons do not describe a (signed) affine.min / affine.max.
+
+// CHECK-LABEL: @select_unsigned_not_raised
+// CHECK:         arith.select
+// CHECK-NOT:     affine.min
+// CHECK-NOT:     affine.max
+func.func @select_unsigned_not_raised(%a: index, %b: index) -> index {
+  %c = arith.cmpi ult, %a, %b : index
+  %r = arith.select %c, %a, %b : index
+  return %r : index
+}
+
+// -----
+
+// A multi-dimensional `scf.parallel` with constant steps is raised.
+
+// CHECK-LABEL: @parallel_2d
+// CHECK-SAME:  %[[ARR:.*]]: memref<?x?xi32>, %[[UB0:.*]]: index, %[[UB1:.*]]: index
+// CHECK:         affine.parallel (%[[I:.*]], %[[J:.*]]) = (0, 0) to (symbol(%[[UB0]]), symbol(%[[UB1]])) {
+// CHECK:           memref.store %{{.*}}, %[[ARR]][%[[I]], %[[J]]]
+// CHECK-NOT:     scf.parallel
+func.func @parallel_2d(%arr: memref<?x?xi32>, %ub0: index, %ub1: index) {
+  %c0 = arith.constant 0 : i32
+  %lb = arith.constant 0 : index
+  %s = arith.constant 1 : index
+  scf.parallel (%i, %j) = (%lb, %lb) to (%ub0, %ub1) step (%s, %s) {
+    memref.store %c0, %arr[%i, %j] : memref<?x?xi32>
+    scf.reduce
+  }
+  return
+}
+
+// -----
+
+// A single-op reduction initialized to its neutral element becomes an
+// affine.parallel reduction.
+
+// CHECK-LABEL: @parallel_reduction_addf
+// CHECK-SAME:  %[[ARR:.*]]: memref<?xf32>, %[[UB:.*]]: index
+// CHECK:         %[[R:.*]] = affine.parallel (%[[I:.*]]) = (0) to (symbol(%[[UB]])) reduce ("addf") -> (f32) {
+// CHECK:           %[[V:.*]] = memref.load %[[ARR]][%[[I]]]
+// CHECK:           affine.yield %[[V]] : f32
+// CHECK:         return %[[R]]
+func.func @parallel_reduction_addf(%arr: memref<?xf32>, %ub: index) -> f32 {
+  %lb = arith.constant 0 : index
+  %s = arith.constant 1 : index
+  %init = arith.constant 0.0 : f32
+  %r = scf.parallel (%i) = (%lb) to (%ub) step (%s) init (%init) -> f32 {
+    %v = memref.load %arr[%i] : memref<?xf32>
+    scf.reduce(%v : f32) {
+    ^bb(%a: f32, %b: f32):
+      %sum = arith.addf %a, %b : f32
+      scf.reduce.return %sum : f32
+    }
+  }
+  return %r : f32
+}
+
+// -----
+
+// A select-min upper bound is folded into the affine.parallel bound.
+
+// CHECK-LABEL: @parallel_select_min_bound
+// CHECK-NOT:     arith.select
+// CHECK:         affine.parallel (%{{.*}}) = (0) to (min(symbol(%{{.*}}), symbol(%{{.*}}))) {
+func.func @parallel_select_min_bound(%arr: memref<?xi32>, %a: index, %b: index) {
+  %c0 = arith.constant 0 : i32
+  %lb = arith.constant 0 : index
+  %s = arith.constant 1 : index
+  %c = arith.cmpi slt, %a, %b : index
+  %ub = arith.select %c, %a, %b : index
+  scf.parallel (%i) = (%lb) to (%ub) step (%s) {
+    memref.store %c0, %arr[%i] : memref<?xi32>
+    scf.reduce
+  }
+  return
+}
+
+// -----
+
+// A non-constant step cannot be represented by affine.parallel.
+
+// CHECK-LABEL: @parallel_non_constant_step_not_raised
+// CHECK:         scf.parallel
+// CHECK-NOT:     affine.parallel
+func.func @parallel_non_constant_step_not_raised(%arr: memref<?xi32>, %ub: index, %s: index) {
+  %c0 = arith.constant 0 : i32
+  %lb = arith.constant 0 : index
+  scf.parallel (%i) = (%lb) to (%ub) step (%s) {
+    memref.store %c0, %arr[%i] : memref<?xi32>
+    scf.reduce
+  }
+  return
+}
+
+// -----
+
+// affine.parallel seeds reductions with the neutral element, so a non-neutral
+// init cannot be raised.
+
+// CHECK-LABEL: @parallel_non_neutral_init_not_raised
+// CHECK:         scf.parallel
+// CHECK-NOT:     affine.parallel
+func.func @parallel_non_neutral_init_not_raised(%arr: memref<?xf32>, %ub: index) -> f32 {
+  %lb = arith.constant 0 : index
+  %s = arith.constant 1 : index
+  %init = arith.constant 1.0 : f32
+  %r = scf.parallel (%i) = (%lb) to (%ub) step (%s) init (%init) -> f32 {
+    %v = memref.load %arr[%i] : memref<?xf32>
+    scf.reduce(%v : f32) {
+    ^bb(%a: f32, %b: f32):
+      %sum = arith.addf %a, %b : f32
+      scf.reduce.return %sum : f32
+    }
+  }
+  return %r : f32
+}
+
+// -----
+
+// A reduction whose combiner is more than a single op is left in scf.
+
+// CHECK-LABEL: @parallel_multi_op_reduction_not_raised
+// CHECK:         scf.parallel
+// CHECK-NOT:     affine.parallel
+func.func @parallel_multi_op_reduction_not_raised(%arr: memref<?xf32>, %ub: index) -> f32 {
+  %lb = arith.constant 0 : index
+  %s = arith.constant 1 : index
+  %init = arith.constant 0.0 : f32
+  %r = scf.parallel (%i) = (%lb) to (%ub) step (%s) init (%init) -> f32 {
+    %v = memref.load %arr[%i] : memref<?xf32>
+    scf.reduce(%v : f32) {
+    ^bb(%a: f32, %b: f32):
+      %t = arith.addf %a, %b : f32
+      %u = arith.mulf %t, %t : f32
+      scf.reduce.return %u : f32
+    }
+  }
+  return %r : f32
+}

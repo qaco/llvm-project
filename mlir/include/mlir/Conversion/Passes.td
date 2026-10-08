@@ -1219,8 +1219,8 @@ def RaiseSCFToAffinePass : Pass<"raise-scf-to-affine"> {
   let summary = "Raise SCF operations to affine operations (best effort)";
   let description = [{
     Raising to the affine dialect enables affine analyses and transforms such
-    as loop tiling, unrolling, vectorization, and dependence analysis.
-    Currently only `scf.for` is handled; loops that cannot be raised are left
+    as loop tiling, unrolling, vectorization, and dependence analysis. `scf.for`
+    and `scf.parallel` are handled; loops that cannot be raised are left
     unchanged.
 
     A `scf.for` is raised when its lower and upper bounds are valid affine
@@ -1233,6 +1233,16 @@ def RaiseSCFToAffinePass : Pass<"raise-scf-to-affine"> {
         original induction variable is reconstructed in the body. An
         `affine.min` upper bound is supported here; an `affine.max` lower bound
         is not, as it cannot be raised soundly without a constant step.
+
+    An `scf.parallel` is raised when every bound is a valid affine dimension (or
+    an `affine.max` / `affine.min`), every step is constant, and each reduction
+    is a single recognized `arith` combiner whose initial value is that
+    combiner's neutral element (`affine.parallel` seeds reductions with the
+    neutral element).
+
+    An `arith.select` fed by an `arith.cmpi` that implements a signed min/max
+    idiom over valid affine operands is rewritten to `affine.min` / `affine.max`
+    so it can serve as a loop bound.
 
     Bounds and step of non-`index` type are cast to `index` first if the source
     type allows lossless conversion (otherwise we do not touch the loop). In any
